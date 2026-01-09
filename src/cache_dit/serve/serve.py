@@ -161,6 +161,13 @@ def get_args(
             "sage",
         ],
     )
+    parser.add_argument(
+        "--rmsnorm-backend",
+        type=str,
+        default=None,
+        choices=[None, "flashinfer"],
+        help="Accelerate RMSNorm inside transformer using flashinfer.norm.rmsnorm.",
+    )
     parser.add_argument("--perf", action="store_true", default=False)
     parser.add_argument("--prompt", type=str, default=None, help="Override default prompt")
     parser.add_argument(
@@ -393,6 +400,7 @@ def launch_server(args=None):
         parallel_type=args.parallel_type,
         parallel_args=parallel_args,
         attn_backend=args.attn,
+        rmsnorm_backend=args.rmsnorm_backend,
         quantize=args.quantize,
         quantize_type=args.quantize_type,
         pipeline_quant_config_path=args.pipeline_quant_config_path,

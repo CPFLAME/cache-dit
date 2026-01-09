@@ -543,6 +543,26 @@ def get_args(
         default=True,
         help="profile record shapes for better analysis",
     )
+    parser.add_argument(
+        "--profile-attn-ffn",
+        action="store_true",
+        default=False,
+        help=(
+            "When used with --profile, tag and summarize only transformer ATTN/FFN time "
+            "via record_function hooks (does not change generation outputs)."
+        ),
+    )
+    parser.add_argument(
+        "--rmsnorm-backend",
+        type=str,
+        default=None,
+        choices=[None, "flashinfer"],
+        help=(
+            "Accelerate RMSNorm inside transformer. "
+            "Use 'flashinfer' to enable flashinfer.norm.rmsnorm (recommended in zhoubian_build_zimage). "
+            "If not set, keep original RMSNorm."
+        ),
+    )
     # Lora settings
     parser.add_argument(
         "--disable-fuse-lora",
@@ -1293,6 +1313,38 @@ def maybe_apply_optimization(
     maybe_quantize_transformer(args, pipe_or_adapter)
     maybe_quantize_text_encoder(args, pipe_or_adapter)
     maybe_quantize_controlnet(args, pipe_or_adapter)
+
+    # Norm optimizations (apply before compilation)
+    if getattr(args, "rmsnorm_backend", None):
+        try:
+            from cache_dit.optimizations.rmsnorm import patch_rmsnorm_modules
+
+            # Patch transformer modules (and optionally text encoder/controlnet if user wants later)
+            targets = []
+            if isinstance(pipe_or_adapter, BlockAdapter):
+                # BlockAdapter may hold transformer modules directly
+                transformer = getattr(pipe_or_adapter, "transformer", None)
+                if isinstance(transformer, list):
+                    targets.extend([t for t in transformer if isinstance(t, torch.nn.Module)])
+                elif isinstance(transformer, torch.nn.Module):
+                    targets.append(transformer)
+            else:
+                pipe = pipe_or_adapter
+                for name in ("transformer", "transformer_2"):
+                    if hasattr(pipe, name) and isinstance(getattr(pipe, name), torch.nn.Module):
+                        targets.append(getattr(pipe, name))
+
+            total_patched = 0
+            total_skipped = 0
+            for m in targets:
+                r = patch_rmsnorm_modules(m, backend=args.rmsnorm_backend)
+                total_patched += r.patched
+                total_skipped += r.skipped
+            logger.info(
+                f"RMSNorm backend={args.rmsnorm_backend}: patched={total_patched}, skipped={total_skipped}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to enable RMSNorm backend {args.rmsnorm_backend}: {e}")
 
     # VAE Tiling or Slicing
     maybe_vae_tiling_or_slicing(args, pipe_or_adapter)

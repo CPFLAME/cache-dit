@@ -135,6 +135,7 @@ class ModelManager:
         parallel_type: Optional[str] = None,
         parallel_args: Optional[Dict[str, Any]] = None,
         attn_backend: Optional[str] = None,
+        rmsnorm_backend: Optional[str] = None,
         quantize: bool = False,
         quantize_type: Optional[str] = None,
         pipeline_quant_config_path: Optional[str] = None,
@@ -155,6 +156,7 @@ class ModelManager:
         self.parallel_type = parallel_type
         self.parallel_args = parallel_args or {}
         self.attn_backend = attn_backend
+        self.rmsnorm_backend = rmsnorm_backend
         self.quantize = quantize
         self.quantize_type = quantize_type
         self.pipeline_quant_config_path = pipeline_quant_config_path
@@ -166,7 +168,7 @@ class ModelManager:
 
         logger.info(
             f"Initializing ModelManager: model_path={model_path}, device={self.device}, "
-            f"parallel_type={parallel_type}, attn_backend={attn_backend}"
+            f"parallel_type={parallel_type}, attn_backend={attn_backend}, rmsnorm_backend={rmsnorm_backend}"
         )
 
     def startup_warmup(self, resolutions: List[tuple[int, int]], prompt: str):
@@ -430,6 +432,34 @@ class ModelManager:
         if self.enable_cpu_offload and current_platform.device_count() <= 1:
             logger.info("Enabling CPU offload")
             self.pipe.enable_model_cpu_offload()
+
+        # Optional: RMSNorm backend (flashinfer). Only meaningful when weights are on CUDA.
+        if self.rmsnorm_backend is not None:
+            if self.rmsnorm_backend != "flashinfer":
+                logger.warning(f"Unsupported rmsnorm_backend={self.rmsnorm_backend}, skipping.")
+            else:
+                if self.enable_cpu_offload or (self.device_map is not None):
+                    logger.warning(
+                        "rmsnorm-backend=flashinfer is not recommended with cpu offload/device_map; "
+                        "weights may not be on CUDA. Will patch but forward will safely fallback."
+                    )
+                try:
+                    from cache_dit.optimizations.rmsnorm import patch_rmsnorm_modules
+
+                    total_patched = 0
+                    total_skipped = 0
+                    for name in ("transformer", "transformer_2"):
+                        if hasattr(self.pipe, name):
+                            mod = getattr(self.pipe, name)
+                            if isinstance(mod, torch.nn.Module):
+                                r = patch_rmsnorm_modules(mod, backend="flashinfer")
+                                total_patched += r.patched
+                                total_skipped += r.skipped
+                    logger.info(
+                        f"RMSNorm backend=flashinfer: patched={total_patched}, skipped={total_skipped}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to enable rmsnorm-backend=flashinfer: {e}")
 
         if self.attn_backend is not None:
             if hasattr(self.pipe.transformer, "set_attention_backend"):
