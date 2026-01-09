@@ -526,6 +526,20 @@ class Example:
         # actual inference
         model_tag = self.args.example if self.args.example is not None else "None"
         if self.args.profile:
+            # Optional: tag transformer internals (ATTN/FFN) for profiling attribution.
+            # This does not change outputs; it only adds record_function ranges.
+            _attn_ffn_timer = None
+            if getattr(self.args, "profile_attn_ffn", False):
+                try:
+                    from cache_dit.attn_ffn_profiler import attach_attn_ffn_for_profiling
+
+                    hooked, _attn_ffn_timer = attach_attn_ffn_for_profiling(pipe)
+                    if self.rank == 0:
+                        logger.info(f"Enabled ATTN/FFN profiling tags. Hooked modules: {hooked}")
+                except Exception as e:
+                    if self.rank == 0:
+                        logger.warning(f"Failed to enable ATTN/FFN profiling tags: {e}")
+
             profiler = create_profiler_from_args(self.args, profile_name=f"{model_tag}_profile")
             with profiler:
                 for _ in range(self.args.repeat):
@@ -535,6 +549,31 @@ class Example:
                 logger.info(
                     f"Profiler traces saved to: {profiler.output_dir}/{profiler.trace_path.name}"
                 )
+                # If enabled, print an ATTN/FFN-only summary (CUDA time) based on record_function tags.
+                if getattr(self.args, "profile_attn_ffn", False) and getattr(profiler, "profiler", None) is not None:
+                    try:
+                        from cache_dit.attn_ffn_profiler import summarize_attn_ffn_from_profiler
+
+                        # record_function ranges usually don't get cuda_time_total attribution in key_averages().
+                        # so we print both:
+                        # - profiler-based summary (often cpu-time dominated / cuda_time may be 0)
+                        # - CUDA-event based summary (preferred, real GPU attribution)
+                        s_prof = summarize_attn_ffn_from_profiler(profiler.profiler)
+                        logger.info("ATTN/FFN time summary:")
+                        logger.info("1) From torch.profiler key_averages (cuda_time_total for user_annotation is often 0):")
+                        logger.info(f"- ATTN: {s_prof['attn_ms']:.3f} ms ({s_prof['attn_pct']:.1f}%)")
+                        logger.info(f"- FFN : {s_prof['ffn_ms']:.3f} ms ({s_prof['ffn_pct']:.1f}%)")
+                        logger.info(f"- Tagged total: {s_prof['tagged_ms']:.3f} ms")
+
+                        if _attn_ffn_timer is not None and torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            s_evt = _attn_ffn_timer.summarize_ms()
+                            logger.info("2) From CUDA events (preferred, real GPU elapsed time):")
+                            logger.info(f"- ATTN: {s_evt['attn_ms']:.3f} ms ({s_evt['attn_pct']:.1f}%)")
+                            logger.info(f"- FFN : {s_evt['ffn_ms']:.3f} ms ({s_evt['ffn_pct']:.1f}%)")
+                            logger.info(f"- Tagged total: {s_evt['tagged_ms']:.3f} ms")
+                    except Exception as e:
+                        logger.warning(f"Failed to summarize ATTN/FFN from profiler: {e}")
         else:
             for _ in range(self.args.repeat):
                 input_kwargs = self.new_generator(input_kwargs, self.args)
